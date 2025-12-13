@@ -21,7 +21,7 @@
 export HF_ENDPOINT="https://hf-mirror.com"
 
 # 4) 切换到项目目录（改成你自己的路径）
-cd /home/liang/Statis_cpt_lora
+cd /home/leo/Statis_cpt_lora
 
 # 5) 启动训练（全参数微调 metamath）
 python train_roberta_peft.py \

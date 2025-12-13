@@ -13,7 +13,9 @@ from transformers import (
     Trainer,
     set_seed,
 )
-from peft import LoraConfig, get_peft_model, TaskType
+# from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig
+from peft.tuners.lora import LoraModel
 
 
 # -----------------------
@@ -213,21 +215,29 @@ def build_model_and_tokenizer(args):
     if args.method == "lora":
         target_modules = [m.strip() for m in args.lora_target_modules.split(",")]
 
+        # 不再使用 TaskType，也不走 PeftModel，只用底层 LoraModel
         lora_config = LoraConfig(
-            task_type=TaskType.MASKED_LM,  # 对 RoBERTa 的 MLM 任务
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
             bias="none",
             target_modules=target_modules,
-            # PiSSA 等变体在 peft 里也是通过 init_lora_weights 配置的，可后续扩展:contentReference[oaicite:3]{index=3}
         )
 
-        model = get_peft_model(model, lora_config)
-        print("[Model] Wrapped with LoRA. Trainable parameters:")
-        model.print_trainable_parameters()
+        # 用 LoraModel 直接把 LoRA 注入到 RoBERTa 里
+        model = LoraModel(model, lora_config, adapter_name="default")
+
+
+        # 只训练 LoRA 层（底层 peft 已经提供了这个工具函数）
+        if hasattr(model, "mark_only_lora_as_trainable"):
+            model.mark_only_lora_as_trainable()
+
+        print("[Model] Wrapped with LoraModel. Trainable parameters:")
+        if hasattr(model, "print_trainable_parameters"):
+            model.print_trainable_parameters()
     else:
         print("[Model] Full fine-tuning (no LoRA).")
+
 
     total_params, trainable_params = count_parameters(model)
     print(
