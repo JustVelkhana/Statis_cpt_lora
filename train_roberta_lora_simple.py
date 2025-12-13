@@ -362,10 +362,24 @@ def parse_args():
     # parser.add_argument(
     #     "--method", type=str, choices=["full", "lora"], default="lora"
     # )
+    # parser.add_argument(
+    #     "--method", type=str, choices=["full", "lora", "pa_lora"], default="lora",
+    #     help="full: 全量微调; lora: 标准 LoRA; pa_lora: 主成分引导的 LoRA"
+    # )
     parser.add_argument(
-        "--method", type=str, choices=["full", "lora", "pa_lora"], default="lora",
-        help="full: 全量微调; lora: 标准 LoRA; pa_lora: 主成分引导的 LoRA"
+        "--method",
+        type=str,
+        choices=["full", "lora", "gs_lora"],
+        default="lora",
     )
+
+    parser.add_argument("--gs_num_steps", type=int, default=50,
+                    help="GS-LoRA: number of mini-batches for gradient sampling")
+    parser.add_argument("--gs_batch_size", type=int, default=8,
+                        help="GS-LoRA: batch size used for gradient sampling")
+    parser.add_argument("--gs_init_scale", type=float, default=0.1,
+                        help="GS-LoRA: scale factor for initializing LoRA A/B from SVD")
+
     # PA-LoRA 额外超参数：控制初始化扰动大小
     parser.add_argument(
         "--pa_gamma",
@@ -406,44 +420,118 @@ def parse_args():
 # -------------------------------
 # 主流程：训练 + 评估 + 保存结果
 # -------------------------------
+from gs_lora_utils import compute_gradient_svd_bases, init_lora_with_gradient_svd
+from peft import LoraConfig, LoraModel
+
 def main():
     args = parse_args()
     print("[Config]", args)
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     set_seed(args.seed)
 
-    # 1. 加载原始数据
+    # 1. 加载原始数据（与之前相同）
     raw_datasets = load_pissa_dataset(args.sub_task, args.hf_base_url)
     print(f"[Data] Raw columns: {raw_datasets['train'].column_names}")
 
-    # 2. 构建模型 + tokenizer（可选 LoRA）
-    model, tokenizer, total_params, trainable_params = build_model_and_tokenizer(args)
+    # 2. 构建 tokenizer + 原始 RoBERTa 模型（此时还没有 LoRA）
+    print(f"[Model] Loading tokenizer and model from {args.model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    if tokenizer.pad_token is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif tokenizer.cls_token is not None:
+            tokenizer.pad_token = tokenizer.cls_token
 
-    # 3. Tokenize
+    base_model = RobertaForMaskedLM.from_pretrained(args.model_name)
+
+    # 3. Tokenize 数据集（与之前一致，注意不再手动设置 labels）
     tokenized_datasets = tokenize_dataset(raw_datasets, tokenizer, args.max_seq_length)
+    train_dataset = tokenized_datasets["train"]
+    eval_dataset = tokenized_datasets["validation"]
+
+    # 可选：裁剪样本数
     if args.max_train_samples is not None:
-        tokenized_datasets["train"] = tokenized_datasets["train"].select(
-            range(args.max_train_samples)
-        )
+        train_dataset = train_dataset.select(range(args.max_train_samples))
     if args.max_eval_samples is not None:
-        tokenized_datasets["validation"] = tokenized_datasets[
-            "validation"
-        ].select(range(args.max_eval_samples))
+        eval_dataset = eval_dataset.select(range(args.max_eval_samples))
 
     print(
-        f"[Data] tokenized train len = {len(tokenized_datasets['train'])}, "
-        f"val len = {len(tokenized_datasets['validation'])}"
+        f"[Data] tokenized train len = {len(train_dataset)}, "
+        f"val len = {len(eval_dataset)}"
     )
 
-    # 4. MLM 的 collator（会自动随机 mask）
+    # 4. 如果 method == gs_lora，先在 base_model 上做梯度采样 + SVD
+    svd_bases = None
+    if args.method == "gs_lora":
+        svd_bases = compute_gradient_svd_bases(
+            model=base_model,
+            train_dataset=train_dataset,
+            tokenizer=tokenizer,
+            max_seq_length=args.max_seq_length,
+            num_steps=args.gs_num_steps,
+            batch_size=args.gs_batch_size,
+            device=device,
+        )
+        # 梯度采样完毕后，可以把 base_model 的 grad 清空
+        base_model.zero_grad(set_to_none=True)
+
+    # 5. 构建 data_collator（与之前一致）
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=True,
         mlm_probability=0.15,
     )
 
-    # 5. TrainingArguments
-    # 注意：这里只用老版本 Transformers 也支持的字段，不再传 evaluation_strategy 等
+    # 6. 根据 method 决定是否加 LoRA / GS-LoRA
+    if args.method == "full":
+        # 全量微调：直接用 base_model，所有参数可训练
+        model = base_model.to(device)
+        for p in model.parameters():
+            p.requires_grad = True
+        print("[Model] Using FULL fine-tuning.")
+    else:
+        # LoRA 或 GS-LoRA：先构建 LoRA，再根据 method 决定是否做谱初始化
+        target_modules = [m.strip() for m in args.lora_target_modules.split(",")]
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            target_modules=target_modules,
+        )
+        model = LoraModel(base_model, lora_config, "default").to(device)
+
+        if args.method == "lora":
+            print("[Model] Using standard LoRA (random init).")
+        elif args.method == "gs_lora":
+            print("[Model] Using GS-LoRA (gradient-spectral init).")
+            if svd_bases is None:
+                raise RuntimeError("[GS-LoRA] svd_bases is None, gradient sampling did not run?")
+            init_lora_with_gradient_svd(
+                lora_model=model,
+                svd_bases=svd_bases,
+                adapter_name="default",
+                rank=args.lora_r,
+                init_scale=args.gs_init_scale,
+            )
+
+        # LoRA 训练：只训练 LoRA 参数
+        for name, param in model.named_parameters():
+            if "lora_" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+    # 7. 统计参数量（与之前一致）
+    total_params, trainable_params = count_parameters(model)
+    print(
+        f"[Model] total_params = {total_params:,}, "
+        f"trainable_params = {trainable_params:,}, "
+        f"ratio = {trainable_params / total_params * 100:.4f}%"
+    )
+
+    # 8. 构建 TrainingArguments + MyTrainer（保持你原来的写法）
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         overwrite_output_dir=True,
@@ -462,20 +550,21 @@ def main():
         prediction_loss_only=True,
         fp16=args.fp16,
         seed=args.seed,
-
-        # 关键一行：不要自动根据模型 forward 签名删列
         remove_unused_columns=False,
     )
-
 
     trainer = MyTrainer(
         model=model,
         args=training_args,
         data_collator=data_collator,
-        train_dataset=tokenized_datasets["train"],
-        eval_dataset=tokenized_datasets["validation"],
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         tokenizer=tokenizer,
     )
+
+    # 9. 训练 + 评估 + 保存 eval_results.json （保持你已有逻辑）
+    ...
+
 
     # 6. 统计显存峰值
     if torch.cuda.is_available():

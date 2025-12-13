@@ -24,6 +24,11 @@ pip install "transformers" "datasets" "peft" "accelerate" "evaluate" "scikit-lea
 ## 2. 如何运行这三种实验（给你一组命令模板）
 
 假设你在 `Statis_cpt_lora` 根目录下：
+```
+conda activate roberta_peft
+
+```
+
 
 ### 2.1 全量微调（full）
 
