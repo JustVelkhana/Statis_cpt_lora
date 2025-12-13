@@ -147,6 +147,86 @@ def count_parameters(model):
             trainable += n
     return total, trainable
 
+def init_pa_lora(model, rank: int, gamma: float = 1e-2):
+    """
+    对已经注入 LoRA 的模型，按 PA-LoRA 思路进行初始化：
+    - 对每个带 lora_A/lora_B 的层做 SVD(W)，取前 r 个奇异向量
+    - 构造 A0, B0，使得 ΔW^(0) 位于主奇异子空间
+    - 再用 gamma 控制整体扰动大小
+
+    注意：这里只在 CPU 上做 SVD，避免占用 GPU 显存。
+    """
+    import math
+
+    print(f"[PA-LoRA] Initialize LoRA with SVD (rank={rank}, gamma={gamma})")
+
+    for name, module in model.named_modules():
+        # 只处理带 LoRA 结构的层
+        if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
+            continue
+
+        # 适配器名字：我们在构建 LoraModel 时用的是 'default'
+        if "default" in module.lora_A:
+            adapter_name = "default"
+        else:
+            # 兜底（理论上不会走到这里）
+            adapter_name = list(module.lora_A.keys())[0]
+
+        lora_A = module.lora_A[adapter_name]  # nn.Linear(in, r)
+        lora_B = module.lora_B[adapter_name]  # nn.Linear(r, out)
+
+        # 拿到基础权重 W（out_features, in_features）
+        if hasattr(module, "weight") and module.weight is not None:
+            W = module.weight.data.detach().float().cpu()
+        elif hasattr(module, "base_layer") and hasattr(module.base_layer, "weight"):
+            W = module.base_layer.weight.data.detach().float().cpu()
+        else:
+            print(f"[PA-LoRA] Skip {name}: no weight found.")
+            continue
+
+        out_features, in_features = W.shape
+        r = min(rank, out_features, in_features)
+
+        # 计算截断 SVD
+        try:
+            U, S, Vh = torch.linalg.svd(W, full_matrices=False)  # U:[out, k], Vh:[k, in]
+        except Exception as e:
+            print(f"[PA-LoRA] SVD failed on {name}: {e}. Skip.")
+            continue
+
+        U_r = U[:, :r]            # [out, r]
+        S_r = S[:r]               # [r]
+        V_r = Vh[:r, :].T         # [in, r]
+
+        # 构造 A0, B0:
+        # A0 = sqrt(gamma) * Σ_r^{1/2} V_r^T  -> [r, in]
+        # B0 = sqrt(gamma) * U_r Σ_r^{1/2}    -> [out, r]
+        S_sqrt = torch.sqrt(S_r + 1e-8)             # [r]
+        sqrt_gamma = math.sqrt(gamma)
+
+        Vt = V_r.T                                   # [r, in]
+        # [r, in] = [r,1] * [r,in]（广播）
+        A0 = (S_sqrt.unsqueeze(1) * Vt) * sqrt_gamma
+
+        # [out, r] = [out,r] * [1,r]（广播）
+        B0 = (U_r * S_sqrt.unsqueeze(0)) * sqrt_gamma
+
+        # 拷贝到 LoRA 模块中
+        with torch.no_grad():
+            if lora_A.weight.shape != A0.shape:
+                print(f"[PA-LoRA] Shape mismatch in A for {name}: "
+                      f"lora_A.weight={tuple(lora_A.weight.shape)}, A0={tuple(A0.shape)}")
+                continue
+            if lora_B.weight.shape != B0.shape:
+                print(f"[PA-LoRA] Shape mismatch in B for {name}: "
+                      f"lora_B.weight={tuple(lora_B.weight.shape)}, B0={tuple(B0.shape)}")
+                continue
+
+            lora_A.weight.data.copy_(A0.to(lora_A.weight.device))
+            lora_B.weight.data.copy_(B0.to(lora_B.weight.device))
+
+        print(f"[PA-LoRA] Initialized layer {name} with rank={r}")
+
 
 # -------------------------------
 # 构建 RoBERTa + （可选）LoRA
@@ -163,11 +243,10 @@ def build_model_and_tokenizer(args):
 
     model = RobertaForMaskedLM.from_pretrained(args.model_name)
 
-    if args.method == "lora":
+    if args.method in ["lora", "pa_lora"]:
         target_modules = [m.strip() for m in args.lora_target_modules.split(",")]
         print(f"[LoRA] target_modules = {target_modules}")
 
-        # 不再使用 TaskType，也不使用 get_peft_model
         lora_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
@@ -176,17 +255,22 @@ def build_model_and_tokenizer(args):
             target_modules=target_modules,
         )
 
-        # 关键：正确调用顺序（model, config, adapter_name）
+        # 注入 LoRA 结构
         model = LoraModel(model, lora_config, "default")
 
-        # 冻结 base 参数，只训练 LoRA 参数
+        # 如果是 PA-LoRA，则在此基础上做 SVD 初始化
+        if args.method == "pa_lora":
+            init_pa_lora(model, rank=args.lora_r, gamma=args.pa_gamma)
+
+        # 冻结 base 参数，只训练 LoRA
         for name, param in model.named_parameters():
             if "lora_" in name:
                 param.requires_grad = True
             else:
                 param.requires_grad = False
 
-        print("[Model] LoRA wrapped.")
+        print(f"[Model] {args.method} wrapped.")
+
     else:
         print("[Model] Full fine-tuning (no LoRA).")
 
@@ -275,9 +359,21 @@ def parse_args():
         type=str,
         default="https://hf-mirror.com/datasets/fxmeng/pissa-dataset/resolve/main",
     )
+    # parser.add_argument(
+    #     "--method", type=str, choices=["full", "lora"], default="lora"
+    # )
     parser.add_argument(
-        "--method", type=str, choices=["full", "lora"], default="lora"
+        "--method", type=str, choices=["full", "lora", "pa_lora"], default="lora",
+        help="full: 全量微调; lora: 标准 LoRA; pa_lora: 主成分引导的 LoRA"
     )
+    # PA-LoRA 额外超参数：控制初始化扰动大小
+    parser.add_argument(
+        "--pa_gamma",
+        type=float,
+        default=1e-2,
+        help="PA-LoRA 初始化时的缩放因子 gamma，越小初始扰动越小 (默认 1e-2)。",
+    )
+
 
     # LoRA 超参数
     parser.add_argument("--lora_r", type=int, default=8)
