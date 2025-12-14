@@ -570,40 +570,53 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    # 7. 训练
     print("[Train] Start training...")
     train_result = trainer.train()
-    trainer.save_model(args.output_dir)  # 会调用自定义 _save
+    trainer.save_state()
 
-    # 8. 评估
+    # 统计参数量（你之前已经有 count_parameters）
+    total_params, trainable_params = count_parameters(model)
+    trainable_ratio = trainable_params / total_params
+
+    # 评估
+    print("[Eval] Evaluating...")
     eval_metrics = trainer.evaluate()
+
+    # 1) 确保有 eval_loss
     eval_loss = eval_metrics.get("eval_loss", None)
     if eval_loss is not None:
-        eval_metrics["mlm_loss"] = float(eval_loss)
+        eval_loss = float(eval_loss)
+        eval_metrics["mlm_loss"] = eval_loss
         eval_metrics["mlm_perplexity"] = float(math.exp(eval_loss))
+    else:
+        print("[WARN] eval_loss not found in eval_metrics, cannot compute perplexity.")
 
-    # 9. 记录参数量
-    eval_metrics["total_params"] = int(total_params)
-    eval_metrics["trainable_params"] = int(trainable_params)
-    eval_metrics["trainable_params_ratio"] = float(
-        trainable_params / total_params
-    )
+    # 2) 加上参数与显存统计
+    eval_metrics["total_params"] = float(total_params)
+    eval_metrics["trainable_params"] = float(trainable_params)
+    eval_metrics["trainable_params_ratio"] = float(trainable_ratio)
 
-    # 10. 显存峰值（MB）
     if torch.cuda.is_available():
-        peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 2)
-        eval_metrics["peak_gpu_mem_MB"] = float(peak_mem)
+        peak_mem_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+    else:
+        peak_mem_mb = 0.0
+    eval_metrics["peak_gpu_mem_MB"] = float(peak_mem_mb)
 
+    # 打印 + 保存（先把完整的 eval_metrics 存到 json）
     print("***** Eval metrics *****")
     for k, v in eval_metrics.items():
         print(f"{k}: {v}")
 
-    # 11. 保存到 eval_results.json（供后续 analyze 脚本读取）
-    os.makedirs(args.output_dir, exist_ok=True)
-    out_path = os.path.join(args.output_dir, "eval_results.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(eval_metrics, f, indent=2, ensure_ascii=False)
-    print(f"[Save] Eval metrics saved to {out_path}")
+    save_path = os.path.join(args.output_dir, "eval_results.json")
+    print(f"[Save] Eval metrics saved to {save_path}")
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(eval_metrics, f, indent=2)
+
+    # 给 HF 的 log/metrics 去掉 peak_gpu_mem_MB，避免 metrics_format 报错
+    hf_metrics = {k: v for k, v in eval_metrics.items() if k != "peak_gpu_mem_MB"}
+    trainer.log_metrics("eval", hf_metrics)
+    trainer.save_metrics("eval", hf_metrics)
+
 
 
 if __name__ == "__main__":

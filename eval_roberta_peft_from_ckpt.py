@@ -1,296 +1,355 @@
-import os
+import argparse
 import json
 import math
-from typing import List, Dict
+import os
+import random
+import time
 
 import torch
+from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     RobertaForMaskedLM,
     DataCollatorForLanguageModeling,
-    TrainingArguments,
-    Trainer,
-    set_seed,
 )
+from peft import LoraModel
 
-try:
-    from peft import PeftModel, PeftConfig
-    PEFT_AVAILABLE = True
-except ImportError:
-    PEFT_AVAILABLE = False
+from peft import LoraModel
 
 
-# ------------------ 参数解析 ------------------
-
-def parse_args():
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Evaluate RoBERTa / RoBERTa+LoRA checkpoint on PiSSA metamath/python"
-    )
-
-    parser.add_argument(
-        "--checkpoint_dir",
-        type=str,
-        required=True,
-        help="checkpoint 路径，例如 outputs/roberta_full_metamath/checkpoint-5000",
-    )
-    parser.add_argument(
-        "--sub_task",
-        type=str,
-        choices=["metamath", "python"],
-        required=True,
-        help="使用 metamath 或 python 子数据集",
-    )
-    parser.add_argument(
-        "--hf_base_url",
-        type=str,
-        default="https://hf-mirror.com/datasets/fxmeng/pissa-dataset/resolve/main",
-        help="PiSSA 数据根 URL",
-    )
-    parser.add_argument(
-        "--max_seq_length",
-        type=int,
-        default=512,
-        help="最大序列长度",
-    )
-    parser.add_argument(
-        "--per_device_eval_batch_size",
-        type=int,
-        default=8,
-        help="每个设备的 eval batch size",
-    )
-    parser.add_argument(
-        "--max_eval_samples",
-        type=int,
-        default=None,
-        help="用于调试，限制验证集样本数",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
-
-    args = parser.parse_args()
-    return args
+# -------------------------------
+# 工具函数：随机种子
+# -------------------------------
+def set_seed(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-# ------------------ 数据加载 & 预处理（和训练脚本一致） ------------------
+# -------------------------------
+# 数据集加载（PiSSA metamath/python）
+# -------------------------------
+def load_pissa_dataset(sub_task: str, hf_base_url: str):
+    """
+    从 PiSSA 数据集镜像加载 JSON 数据。
+      - {hf_base_url}/metamath/train.json
+      - {hf_base_url}/metamath/test.json
+      - {hf_base_url}/python/train.json
+      - {hf_base_url}/python/test.json
+    """
+    assert sub_task in ["metamath", "python"]
 
-def build_pissa_data_urls(args) -> Dict[str, str]:
-    base = args.hf_base_url.rstrip("/")
-    if args.sub_task == "metamath":
-        train_url = f"{base}/metamath/train.json"
-        test_url = f"{base}/metamath/test.json"
-    elif args.sub_task == "python":
-        train_url = f"{base}/python/train.json"
-        test_url = f"{base}/python/test.json"
-    else:
-        raise ValueError(f"Unknown sub_task: {args.sub_task}")
+    train_url = f"{hf_base_url}/{sub_task}/train.json"
+    val_url = f"{hf_base_url}/{sub_task}/test.json"  # 用 test 作为 validation
 
-    data_files = {"train": train_url, "validation": test_url}
+    data_files = {"train": train_url, "validation": val_url}
     print(f"[Data] Use data_files = {data_files}")
-    return data_files
 
-
-def load_and_tokenize_dataset(args, tokenizer):
-    data_files = build_pissa_data_urls(args)
     raw_datasets = load_dataset("json", data_files=data_files)
-    column_names = raw_datasets["train"].column_names
-    print(f"[Data] Raw columns: {column_names}")
+    return raw_datasets
 
-    def preprocess_function(batch):
-        # batch-wise 处理 instruction / input / output
-        any_key = next(iter(batch.keys()))
-        batch_size = len(batch[any_key])
-        texts: List[str] = []
 
-        for i in range(batch_size):
-            instr = batch["instruction"][i] if "instruction" in batch else ""
-            inp = batch["input"][i] if "input" in batch else ""
-            out = batch["output"][i] if "output" in batch else ""
+# -------------------------------
+# 把一条样本拼成一个长文本（用于 MLM）
+# -------------------------------
+def build_text(instruction, input_text, output_text):
+    instruction = (instruction or "").strip()
+    input_text = (input_text or "").strip()
+    output_text = (output_text or "").strip()
 
-            text_parts = []
-            if isinstance(instr, str) and instr.strip():
-                text_parts.append("Instruction: " + instr.strip())
-            if isinstance(inp, str) and inp.strip():
-                text_parts.append("Input: " + inp.strip())
-            if isinstance(out, str) and out.strip():
-                text_parts.append("Output: " + out.strip())
+    if input_text:
+        text = (
+            "Instruction:\n"
+            + instruction
+            + "\n\nInput:\n"
+            + input_text
+            + "\n\nOutput:\n"
+            + output_text
+        )
+    else:
+        text = "Instruction:\n" + instruction + "\n\nOutput:\n" + output_text
+    return text
 
-            if not text_parts:
-                if "text" in batch:
-                    text = batch["text"][i]
-                else:
-                    raise ValueError("Example has no usable instruction/input/output/text fields")
-            else:
-                text = "\n".join(text_parts)
 
-            texts.append(text)
-
+# -------------------------------
+# Tokenize 数据集（和训练脚本保持一致）
+# -------------------------------
+def tokenize_dataset(raw_datasets, tokenizer, max_seq_length: int):
+    def preprocess_fn(batch):
+        texts = [
+            build_text(ins, inp, out)
+            for ins, inp, out in zip(
+                batch["instruction"], batch["input"], batch["output"]
+            )
+        ]
         tokenized = tokenizer(
             texts,
-            max_length=args.max_seq_length,
             truncation=True,
+            max_length=max_seq_length,
             padding="max_length",
         )
         return tokenized
 
+    column_names = list(raw_datasets["train"].column_names)
     tokenized_datasets = raw_datasets.map(
-        preprocess_function,
+        preprocess_fn,
         batched=True,
         remove_columns=column_names,
         desc="Tokenizing dataset",
     )
-
-    if args.max_eval_samples is not None:
-        tokenized_datasets["validation"] = tokenized_datasets["validation"].select(
-            range(args.max_eval_samples)
-        )
-
-    print(f"[Data] tokenized val len = {len(tokenized_datasets['validation'])}")
     return tokenized_datasets
 
 
-# ------------------ 加载模型（自动识别 full / LoRA） ------------------
-
-def load_model_and_tokenizer_from_checkpoint(checkpoint_dir: str):
-    """
-    - 如果 checkpoint_dir 里有 adapter_config.json，则认为是 LoRA/PEFT 模型：
-        * 使用 PeftConfig 读取 base_model_name_or_path
-        * 再用 PeftModel.from_pretrained 加载
-    - 否则认为是普通 RoBERTa MLM checkpoint：
-        * 直接 RobertaForMaskedLM.from_pretrained(checkpoint_dir)
-    """
-    checkpoint_dir = checkpoint_dir.rstrip("/")
-    print(f"[Model] Loading from checkpoint_dir = {checkpoint_dir}")
-
-    # tokenizer 直接从 checkpoint 加载，里面有 vocab / merges 等
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
-
-    adapter_cfg_path = os.path.join(checkpoint_dir, "adapter_config.json")
-    if os.path.exists(adapter_cfg_path):
-        if not PEFT_AVAILABLE:
-            raise RuntimeError(
-                f"Detected adapter_config.json in {checkpoint_dir}, "
-                "but peft is not installed. Please pip install peft."
-            )
-        print("[Model] Detected LoRA/PEFT checkpoint (adapter_config.json found).")
-        peft_config = PeftConfig.from_pretrained(checkpoint_dir)
-        base_model_name = peft_config.base_model_name_or_path or "roberta-base"
-        print(f"[Model] Base model = {base_model_name}")
-
-        base_model = RobertaForMaskedLM.from_pretrained(base_model_name)
-        model = PeftModel.from_pretrained(base_model, checkpoint_dir)
-    else:
-        print("[Model] No adapter_config.json, treating as full RoBERTa MLM checkpoint.")
-        model = RobertaForMaskedLM.from_pretrained(checkpoint_dir)
-
-    return model, tokenizer
-
-
+# -------------------------------
+# 统计参数量
+# -------------------------------
 def count_parameters(model):
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = 0
+    trainable = 0
+    for p in model.parameters():
+        n = p.numel()
+        total += n
+        if p.requires_grad:
+            trainable += n
     return total, trainable
 
 
-# ------------------ 构造 TrainingArguments（只用于 eval） ------------------
+# -------------------------------
+# 根据方法与 checkpoint 构建模型
+# -------------------------------
+from peft import PeftModel  # 确保顶部已经有这个 import
 
-def build_eval_training_args(output_root: str, args) -> TrainingArguments:
-    os.makedirs(output_root, exist_ok=True)
+def build_model_from_ckpt(method: str,
+                          ckpt_dir: str,
+                          model_name: str,
+                          lora_r: int,
+                          lora_alpha: int,
+                          lora_dropout: float,
+                          lora_target_modules: str,
+                          device: str):
+    if method == "full":
+        # 对 full：checkpoint-xxxx 里已经是一个 RobertaForMaskedLM
+        print(f"[Model] Loading FULL model from {ckpt_dir}")
+        model = RobertaForMaskedLM.from_pretrained(ckpt_dir)
+        # 全量参数都视为可训练（用于统计）
+        for p in model.parameters():
+            p.requires_grad = True
+    else:
+        # 对 LoRA / GS-LoRA：先加载 base model，再从 checkpoint 目录加载 LoRA adapter
+        print(f"[Model] Loading base model {model_name}")
+        base_model = RobertaForMaskedLM.from_pretrained(model_name)
 
-    training_args = TrainingArguments(
-        output_dir=output_root,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
-        # 以下都是老版本 transformers 会支持的基础参数
-        do_train=False,   # 某些版本没有这个参数的话可以删掉
-        do_eval=True,
-        seed=args.seed,
-        logging_steps=100,
-    )
-    return training_args
+        print(f"[Model] Loading LoRA adapter from {ckpt_dir}")
+        # 使用 PeftModel.from_pretrained 来加载 LoRA 权重
+        model = PeftModel.from_pretrained(
+            base_model,
+            ckpt_dir,
+            adapter_name="default",
+        )
+
+        # 只把 LoRA 参数标记为 requires_grad=True，方便后面统计 trainable_params
+        for name, param in model.named_parameters():
+            if "lora_" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+        if method == "lora":
+            print("[Model] Use standard LoRA for evaluation.")
+        elif method == "gs_lora":
+            print("[Model] Use GS-LoRA for evaluation (结构与 LoRA 相同).")
+
+    model.to(device)
+    return model
 
 
-# ------------------ 主流程：evaluate 并存 metrics ------------------
-
-def main():
-    args = parse_args()
-    set_seed(args.seed)
-
-    checkpoint_dir = args.checkpoint_dir.rstrip("/")
-    # root 输出目录：写 eval_results.json 在这里
-    output_root = os.path.dirname(checkpoint_dir)
-    print(f"[Main] checkpoint_dir = {checkpoint_dir}")
-    print(f"[Main] output_root    = {output_root}")
-
-    # 1) 加载模型 & tokenizer
-    model, tokenizer = load_model_and_tokenizer_from_checkpoint(checkpoint_dir)
-
-    # 2) 加载 & tokenize 数据集
-    tokenized_datasets = load_and_tokenize_dataset(args, tokenizer)
-
-    # 3) collator：MLM 随机 mask
+# -------------------------------
+# 主评估流程（纯手写循环，不用 Trainer）
+# -------------------------------
+def evaluate_model(model,
+                   eval_dataset,
+                   tokenizer,
+                   batch_size: int,
+                   device: str):
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=True,
         mlm_probability=0.15,
     )
-
-    # 4) TrainingArguments（只用来控制 eval dataloader）
-    training_args = build_eval_training_args(output_root, args)
-
-    # 5) Trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        eval_dataset=tokenized_datasets["validation"],
-        tokenizer=tokenizer,
-        data_collator=data_collator,
+    dataloader = DataLoader(
+        eval_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=data_collator,
     )
 
-    # 6) 显存统计
+    model.eval()
+    n_steps = 0
+    n_samples = 0
+    sum_loss = 0.0
+
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    print("[Eval] Start evaluation on validation set...")
-    metrics = trainer.evaluate()
+    t0 = time.time()
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss = outputs.loss  # 平均到 batch 里的 tokens 上
+            bs = batch["input_ids"].size(0)
 
-    # 7) 追加我们需要的字段：mlm_loss, mlm_perplexity, 参数量, 显存峰值等
-    eval_loss = float(metrics.get("eval_loss", float("nan")))
-    if not math.isnan(eval_loss):
-        mlm_loss = eval_loss
-        mlm_ppl = math.exp(mlm_loss)
-    else:
-        mlm_loss = float("nan")
-        mlm_ppl = float("nan")
+            sum_loss += loss.item() * bs
+            n_samples += bs
+            n_steps += 1
 
-    metrics["mlm_loss"] = mlm_loss
-    metrics["mlm_perplexity"] = mlm_ppl
+    eval_runtime = time.time() - t0
+    eval_loss = sum_loss / max(n_samples, 1)
 
-    total_params, trainable_params = count_parameters(model)
-    metrics["total_params"] = int(total_params)
-    metrics["trainable_params"] = int(trainable_params)
-    metrics["trainable_params_ratio"] = float(trainable_params) / float(total_params) if total_params > 0 else float("nan")
+    eval_samples_per_second = n_samples / eval_runtime if eval_runtime > 0 else 0.0
+    eval_steps_per_second = n_steps / eval_runtime if eval_runtime > 0 else 0.0
 
     if torch.cuda.is_available():
-        peak_mem_bytes = torch.cuda.max_memory_allocated()
-        metrics["peak_gpu_mem_MB"] = peak_mem_bytes / (1024 ** 2)
+        peak_mem_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+    else:
+        peak_mem_mb = 0.0
 
-    print("\n***** Eval metrics *****")
-    for k, v in metrics.items():
+    try:
+        mlm_ppl = math.exp(eval_loss)
+    except OverflowError:
+        mlm_ppl = float("inf")
+
+    metrics = {
+        "eval_loss": float(eval_loss),
+        "mlm_loss": float(eval_loss),
+        "mlm_perplexity": float(mlm_ppl),
+        "eval_runtime": float(eval_runtime),
+        "eval_samples_per_second": float(eval_samples_per_second),
+        "eval_steps_per_second": float(eval_steps_per_second),
+        "peak_gpu_mem_MB": float(peak_mem_mb),
+    }
+
+    return metrics
+
+
+# -------------------------------
+# 参数解析
+# -------------------------------
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--method", type=str,
+                        choices=["full", "lora", "gs_lora"],
+                        required=True,
+                        help="full / lora / gs_lora")
+    parser.add_argument("--ckpt_dir", type=str, required=True,
+                        help="checkpoint 目录，例如 outputs/.../checkpoint-24688")
+    parser.add_argument("--model_name", type=str, default="roberta-base")
+    parser.add_argument("--sub_task", type=str,
+                        choices=["metamath", "python"],
+                        default="metamath")
+    parser.add_argument(
+        "--hf_base_url",
+        type=str,
+        default="https://hf-mirror.com/datasets/fxmeng/pissa-dataset/resolve/main",
+    )
+    parser.add_argument("--max_seq_length", type=int, default=512)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=42)
+
+    # LoRA 结构信息（用于从 checkpoint 恢复模型时数结构）
+    parser.add_argument("--lora_r", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.1)
+    parser.add_argument("--lora_target_modules", type=str,
+                        default="query,key,value")
+
+    parser.add_argument(
+        "--output_json",
+        type=str,
+        default=None,
+        help="评估结果保存路径（默认写到 ckpt_dir/eval_results_from_ckpt.json）",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    print("[Config]", args)
+
+    set_seed(args.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # 1. 加载数据 + tokenizer
+    raw_datasets = load_pissa_dataset(args.sub_task, args.hf_base_url)
+    print(f"[Data] Raw columns: {raw_datasets['train'].column_names}")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    if tokenizer.pad_token is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif tokenizer.cls_token is not None:
+            tokenizer.pad_token = tokenizer.cls_token
+
+    tokenized_datasets = tokenize_dataset(
+        raw_datasets, tokenizer, args.max_seq_length
+    )
+    eval_dataset = tokenized_datasets["validation"]
+    print(f"[Data] eval len = {len(eval_dataset)}")
+
+    # 2. 从 checkpoint 构建模型
+    model = build_model_from_ckpt(
+        method=args.method,
+        ckpt_dir=args.ckpt_dir,
+        model_name=args.model_name,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_target_modules=args.lora_target_modules,
+        device=device,
+    )
+
+    # 3. 统计参数量
+    total_params, trainable_params = count_parameters(model)
+    trainable_ratio = trainable_params / total_params if total_params > 0 else 0.0
+    print(
+        f"[Model] total_params = {total_params:,}, "
+        f"trainable_params = {trainable_params:,}, "
+        f"ratio = {trainable_ratio * 100:.4f}%"
+    )
+
+    # 4. 评估
+    print("[Eval] Evaluating from checkpoint...")
+    eval_metrics = evaluate_model(
+        model=model,
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
+        batch_size=args.per_device_eval_batch_size,
+        device=device,
+    )
+
+    # 补充参数统计信息
+    eval_metrics["total_params"] = float(total_params)
+    eval_metrics["trainable_params"] = float(trainable_params)
+    eval_metrics["trainable_params_ratio"] = float(trainable_ratio)
+    eval_metrics["epoch"] = 1.0  # 你当前都是 1 epoch，可以按需修改
+
+    print("***** Eval metrics from checkpoint *****")
+    for k, v in eval_metrics.items():
         print(f"{k}: {v}")
 
-    # 8) 保存到 output_root/eval_results.json（供分析脚本使用）
-    eval_path = os.path.join(output_root, "eval_results.json")
-    with open(eval_path, "w") as f:
-        json.dump(metrics, f, indent=2, ensure_ascii=False)
+    # 5. 保存到 json
+    if args.output_json is None:
+        save_path = os.path.join(args.ckpt_dir, "eval_results_from_ckpt.json")
+    else:
+        save_path = args.output_json
 
-    print(f"\n[Save] Eval metrics saved to {eval_path}")
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(eval_metrics, f, indent=2)
+
+    print(f"[Save] Eval metrics saved to {save_path}")
 
 
 if __name__ == "__main__":

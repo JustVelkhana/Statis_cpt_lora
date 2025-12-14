@@ -1,0 +1,38 @@
+[
+  {
+    "name": "full_metamath_simple",
+    "label": "Full FT",
+    "method": "full",
+    "eval_loss": 1.4642546732214432,
+    "mlm_perplexity": 4.324319008140957,
+    "eval_runtime": 72.4372091293335,
+    "eval_samples_per_second": 87.2341725468426,
+    "eval_steps_per_second": 10.90599720082381,
+    "total_params": 124697433.0,
+    "trainable_params": 124697433.0
+  },
+  {
+    "name": "lora_r8_metamath",
+    "label": "LoRA r=8",
+    "method": "lora",
+    "eval_loss": 1.633971896654443,
+    "mlm_perplexity": 5.124187094080277,
+    "eval_runtime": 76.49031853675842,
+    "eval_samples_per_second": 82.61176212729879,
+    "eval_steps_per_second": 10.328104459655965,
+    "total_params": 125139801.0,
+    "trainable_params": 442368.0
+  },
+  {
+    "name": "gslora_r8_metamath",
+    "label": "GS-LoRA r=8",
+    "method": "lora",
+    "eval_loss": 1.6606632645371595,
+    "mlm_perplexity": 5.262800315913333,
+    "eval_runtime": 76.26882791519165,
+    "eval_samples_per_second": 82.85167312426138,
+    "eval_steps_per_second": 10.358098080102309,
+    "total_params": 125139801.0,
+    "trainable_params": 442368.0
+  }
+]
